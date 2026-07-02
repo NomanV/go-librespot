@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 )
@@ -72,10 +73,20 @@ func newPipeOutput(opts *NewOutputOptions) (out *pipeOutput, err error) {
 		return nil, fmt.Errorf("unknown output pipe format: %s", opts.OutputPipeFormat)
 	}
 
-	// Open the FIFO for writing as non-blocking to cause an error if there is no reader.
-	out.file, err = os.OpenFile(opts.OutputPipe, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open fifo: %w", err)
+	// Open the FIFO for writing as non-blocking to cause an error if there is
+	// no reader. If the reader is momentarily absent (e.g. the consuming
+	// process is being restarted by its supervisor), retry briefly instead of
+	// failing playback outright.
+	openDeadline := time.Now().Add(15 * time.Second)
+	for {
+		out.file, err = os.OpenFile(opts.OutputPipe, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.ENXIO) || time.Now().After(openDeadline) {
+			return nil, fmt.Errorf("failed to open fifo: %w", err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	// Restore blocking mode now that we are sure we have a reader.
