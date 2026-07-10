@@ -676,6 +676,24 @@ func (p *AppPlayer) skipNext(ctx context.Context, track *connectpb.ContextTrack)
 // past in a row before stopping, so a fully-gated context can't loop forever.
 const maxConsecutiveUnplayableSkips = 50
 
+// unplayableSkipDelay paces a run of audio-key-refused skips. The first couple of skips are
+// free, so a playlist with the odd license-gated track still advances instantly. A longer run
+// is session-level (rate limiting presents as a refusal on every track) and every skip costs
+// another key request: without pacing, a transient throttle turns into a request storm of one
+// key per ~2s, which extends the very throttle that caused it.
+func unplayableSkipDelay(consecutiveSkips int) time.Duration {
+	switch {
+	case consecutiveSkips <= 2:
+		return 0
+	case consecutiveSkips <= 4:
+		return 10 * time.Second
+	case consecutiveSkips <= 6:
+		return 30 * time.Second
+	default:
+		return time.Minute
+	}
+}
+
 func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool, error) {
 	var uri string
 	var hasNextTrack bool
@@ -775,6 +793,16 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
 			p.app.log.WithError(err).Warnf("stopping after %d consecutive unplayable tracks", p.consecutiveUnplayableSkips)
 			p.consecutiveUnplayableSkips = 0
 			return false, err
+		}
+		// Only key refusals are paced: restricted/unsupported media never asked for a key,
+		// so skipping past it fast costs Spotify nothing.
+		if delay := unplayableSkipDelay(p.consecutiveUnplayableSkips); keyErr != nil && delay > 0 {
+			p.app.log.Warnf("backing off %s before next track after %d consecutive audio key refusals", delay, p.consecutiveUnplayableSkips)
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(delay):
+			}
 		}
 		return p.advanceNext(ctx, true, drop)
 	} else if err != nil {
