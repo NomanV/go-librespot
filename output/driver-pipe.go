@@ -9,13 +9,28 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 )
 
+// pipeReopenInterval is how often the output looks for a reader while none
+// has the FIFO open.
+const pipeReopenInterval = 100 * time.Millisecond
+
+// pipeOutput writes PCM to a named pipe. The process on the other end is
+// typically an encoder supervised separately, so it can be restarted or
+// crash independently of us. Losing the reader must not end playback: the
+// output holds the audio source where it is and reattaches to the pipe as
+// soon as a reader is back, so a reader restart is heard as a pause rather
+// than as the track (and the session) stopping.
 type pipeOutput struct {
+	log    librespot.Logger
 	reader librespot.Float32Reader
-	file   *os.File
+	path   string
+
+	// file is nil while no reader has the pipe open.
+	file *os.File
 
 	lock sync.Mutex
 	cond *sync.Cond
@@ -34,7 +49,9 @@ type pipeOutput struct {
 
 func newPipeOutput(opts *NewOutputOptions) (out *pipeOutput, err error) {
 	out = &pipeOutput{
+		log:            opts.Log,
 		reader:         opts.Reader,
+		path:           opts.OutputPipe,
 		volume:         opts.InitialVolume,
 		err:            make(chan error, 2),
 		externalVolume: opts.ExternalVolume,
@@ -72,20 +89,89 @@ func newPipeOutput(opts *NewOutputOptions) (out *pipeOutput, err error) {
 		return nil, fmt.Errorf("unknown output pipe format: %s", opts.OutputPipeFormat)
 	}
 
-	// Open the FIFO for writing as non-blocking to cause an error if there is no reader.
-	out.file, err = os.OpenFile(opts.OutputPipe, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
+	// Attach now so configuration mistakes (missing pipe, permissions) fail
+	// the request loudly. A pipe that merely has no reader yet is fine: the
+	// output loop keeps trying until one shows up.
+	if err := out.open(); err != nil && !errors.Is(err, syscall.ENXIO) {
 		return nil, fmt.Errorf("failed to open fifo: %w", err)
-	}
-
-	// Restore blocking mode now that we are sure we have a reader.
-	if err := syscall.SetNonblock(int(out.file.Fd()), false); err != nil {
-		return nil, fmt.Errorf("failed to set blocking mode on fifo: %w", err)
 	}
 
 	go out.outputLoop()
 
 	return out, nil
+}
+
+// open attaches to the pipe. It returns ENXIO when no process has the pipe
+// open for reading; any other error is a real failure.
+func (out *pipeOutput) open() error {
+	// Open non-blocking so a missing reader is reported instead of hanging.
+	f, err := os.OpenFile(out.path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+
+	// Restore blocking mode now that we are sure we have a reader: writes
+	// then pace against the reader instead of failing with EAGAIN.
+	if err := syscall.SetNonblock(int(f.Fd()), false); err != nil {
+		_ = f.Close()
+		return err
+	}
+
+	out.file = f
+	return nil
+}
+
+// write delivers one chunk to the reader. While no reader has the pipe open
+// it waits, reattaching as soon as one appears, so audio pauses instead of
+// playback ending. A chunk interrupted by the reader going away is written
+// again to the next reader. Must be called with out.lock held; the lock is
+// released while waiting so Pause and Close stay responsive.
+func (out *pipeOutput) write(b []byte) error {
+	for !out.closed {
+		if out.file == nil {
+			if err := out.open(); err != nil {
+				if !errors.Is(err, syscall.ENXIO) {
+					return err
+				}
+
+				out.lock.Unlock()
+				time.Sleep(pipeReopenInterval)
+				out.lock.Lock()
+				continue
+			}
+
+			out.log.Infof("output pipe reader attached")
+		}
+
+		_, err := out.file.Write(b)
+		if err == nil {
+			return nil
+		} else if !errors.Is(err, syscall.EPIPE) {
+			return err
+		}
+
+		// The reader went away mid-stream. Drop the dead descriptor and
+		// wait for the next one.
+		out.log.Warnf("output pipe reader gone, waiting for a new one")
+		_ = out.file.Close()
+		out.file = nil
+	}
+
+	return nil
+}
+
+// fail reports a fatal error and shuts the output down. Must be called with
+// out.lock held.
+func (out *pipeOutput) fail(err error) {
+	out.err <- err
+	out.closed = true
+
+	if out.file != nil {
+		_ = out.file.Close()
+		out.file = nil
+	}
+
+	out.cond.Signal()
 }
 
 func (out *pipeOutput) outputLoop() {
@@ -119,10 +205,8 @@ func (out *pipeOutput) outputLoop() {
 
 		if n > 0 {
 			nn := out.transform(floats[:n], bytes)
-			_, err := out.file.Write(bytes[:nn])
-			if err != nil {
-				out.err <- err
-				out.closed = true
+			if werr := out.write(bytes[:nn]); werr != nil {
+				out.fail(werr)
 				out.lock.Unlock()
 				break
 			}
@@ -133,8 +217,7 @@ func (out *pipeOutput) outputLoop() {
 			out.paused = true
 		} else if err != nil {
 			// Got some other error. Close the output and report the error.
-			out.err <- err
-			out.closed = true
+			out.fail(err)
 			out.lock.Unlock()
 			break
 		}
@@ -201,7 +284,10 @@ func (out *pipeOutput) Close() error {
 		return nil
 	}
 
-	_ = out.file.Close()
+	if out.file != nil {
+		_ = out.file.Close()
+		out.file = nil
+	}
 
 	out.closed = true
 	out.cond.Signal()
