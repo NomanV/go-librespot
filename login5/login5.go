@@ -16,6 +16,18 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	// accessTokenRefreshBefore is how long before the access token expires that
+	// AccessToken starts renewing it. A renewal that fails inside this window is
+	// logged and the still-valid token is returned, so a transient login5 outage
+	// right at expiry time does not take the session down.
+	accessTokenRefreshBefore = 15 * time.Minute
+
+	// errorBodySnippetLen is how many printable bytes of a non-200 login5
+	// response body are quoted in the error message.
+	errorBodySnippetLen = 120
+)
+
 type LoginError struct {
 	Code pb.LoginError
 }
@@ -35,12 +47,28 @@ type Login5 struct {
 	loginOk     *pb.LoginOk
 	loginOkExp  time.Time
 	loginOkLock sync.RWMutex
+
+	// renewLock serialises access token renewals, so that concurrent
+	// AccessToken calls inside the refresh window do not all hit login5.
+	renewLock sync.Mutex
 }
 
 func NewLogin5(log librespot.Logger, client *http.Client, deviceId, clientToken string) *Login5 {
-	baseUrl, err := url.Parse("https://login5.spotify.com/")
+	return newLogin5WithBaseURL(log, client, "https://login5.spotify.com/", deviceId, clientToken)
+}
+
+// newLogin5WithBaseURL is NewLogin5 with an explicit base URL, so that tests
+// can point the client at a fake login5 server.
+func newLogin5WithBaseURL(log librespot.Logger, client *http.Client, rawBaseUrl, deviceId, clientToken string) *Login5 {
+	baseUrl, err := url.Parse(rawBaseUrl)
 	if err != nil {
 		panic("invalid login5 base URL")
+	}
+
+	// JoinPath on an empty path yields a relative request URI ("v3/login"),
+	// which servers reject
+	if baseUrl.Path == "" {
+		baseUrl.Path = "/"
 	}
 
 	return &Login5{
@@ -52,10 +80,33 @@ func NewLogin5(log librespot.Logger, client *http.Client, deviceId, clientToken 
 	}
 }
 
+// printableSnippet returns up to limit printable ASCII bytes of body, so that
+// a text or HTML error page reads cleanly in a log line and a binary body
+// cannot corrupt it.
+func printableSnippet(body []byte, limit int) string {
+	out := make([]byte, 0, limit)
+	for _, b := range body {
+		if b < ' ' || b > '~' {
+			continue
+		}
+
+		out = append(out, b)
+		if len(out) == limit {
+			break
+		}
+	}
+
+	if len(out) == 0 {
+		return fmt.Sprintf("(%d bytes, none printable)", len(body))
+	}
+
+	return string(out)
+}
+
 func (c *Login5) request(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResponse, error) {
 	body, err := proto.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed marhsalling LoginRequest: %w", err)
+		return nil, fmt.Errorf("failed marshalling LoginRequest: %w", err)
 	}
 
 	httpReq := &http.Request{
@@ -81,9 +132,22 @@ func (c *Login5) request(ctx context.Context, req *pb.LoginRequest) (*pb.LoginRe
 		return nil, fmt.Errorf("failed reading login5 response: %w", err)
 	}
 
+	// errors from the edge (503 "no healthy upstream", HTML error pages) come
+	// back as text, not protobuf: report them as such instead of as a
+	// wire-format parse error
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("login5 HTTP %d: %s", resp.StatusCode, printableSnippet(respBody, errorBodySnippetLen))
+	}
+
 	var protoResp pb.LoginResponse
 	if err := proto.Unmarshal(respBody, &protoResp); err != nil {
-		return nil, fmt.Errorf("faield unmarshalling LoginResponse: %w", err)
+		return nil, fmt.Errorf("failed unmarshalling LoginResponse (HTTP %d, %d bytes): %w", resp.StatusCode, len(respBody), err)
+	}
+
+	// a body that parses but carries none of ok, error or challenges is not an
+	// answer, it is an empty 200 from a broken backend
+	if protoResp.GetResponse() == nil {
+		return nil, fmt.Errorf("login5 returned an empty response (HTTP %d, %d bytes)", resp.StatusCode, len(respBody))
 	}
 
 	return &protoResp, nil
@@ -180,32 +244,64 @@ func (c *Login5) StoredCredential() []byte {
 	return c.loginOk.StoredCredential
 }
 
+// currentToken returns the cached access token and the time it expires at.
+func (c *Login5) currentToken() (string, time.Time) {
+	c.loginOkLock.RLock()
+	defer c.loginOkLock.RUnlock()
+
+	if c.loginOk == nil {
+		panic("login5 not authenticated")
+	}
+
+	return c.loginOk.AccessToken, c.loginOkExp
+}
+
+// renew logs in again with the stored credential, replacing the cached token.
+// It must not hold loginOkLock, since Login takes it for writing.
+func (c *Login5) renew(ctx context.Context) error {
+	c.loginOkLock.RLock()
+	username, storedCred := c.loginOk.Username, c.loginOk.StoredCredential
+	c.loginOkLock.RUnlock()
+
+	c.log.Debug("renewing login5 access token")
+	return c.Login(ctx, &credentialspb.StoredCredential{
+		Username: username,
+		Data:     storedCred,
+	})
+}
+
 func (c *Login5) AccessToken() librespot.GetLogin5TokenFunc {
 	return func(ctx context.Context, force bool) (string, error) {
-		c.loginOkLock.RLock()
-		if c.loginOk == nil {
-			panic("login5 not authenticated")
+		token, exp := c.currentToken()
+
+		// if not asked to force a new token and not close to expiry, just return it
+		if !force && time.Now().Before(exp.Add(-accessTokenRefreshBefore)) {
+			return token, nil
 		}
 
-		// if not asked to force a new token and not expired, just return it
-		if !force && c.loginOkExp.After(time.Now()) {
-			defer c.loginOkLock.RUnlock()
-			return c.loginOk.AccessToken, nil
+		// one renewal at a time: a caller that queued behind another renewal
+		// re-checks and normally finds the token it was waiting for
+		c.renewLock.Lock()
+		defer c.renewLock.Unlock()
+
+		token, exp = c.currentToken()
+		if !force && time.Now().Before(exp.Add(-accessTokenRefreshBefore)) {
+			return token, nil
 		}
 
-		username, storedCred := c.loginOk.Username, c.loginOk.StoredCredential
-		c.loginOkLock.RUnlock()
-
-		c.log.Debug("renewing login5 access token")
-		if err := c.Login(ctx, &credentialspb.StoredCredential{
-			Username: username,
-			Data:     storedCred,
-		}); err != nil {
-			return "", fmt.Errorf("failed renewing login5 access token: %w", err)
+		err := c.renew(ctx)
+		if err == nil {
+			token, _ = c.currentToken()
+			return token, nil
 		}
 
-		c.loginOkLock.RLock()
-		defer c.loginOkLock.RUnlock()
-		return c.loginOk.AccessToken, nil
+		// inside the refresh window the old token is still valid: keep using it
+		// and try again on the next call instead of failing the caller
+		if remaining := time.Until(exp); !force && remaining > 0 {
+			c.log.WithError(err).Warnf("failed renewing login5 access token early, keeping the current one for %s", remaining.Round(time.Second))
+			return token, nil
+		}
+
+		return "", fmt.Errorf("failed renewing login5 access token: %w", err)
 	}
 }
